@@ -166,12 +166,20 @@ if mode == M_C:
             asyncio.run(synth("Hello! This is how my voice sounds in your video.", voice, "+0%", p))
             st.audio(open(p, "rb").read())
 
-imgs = st.file_uploader("Images (upload all together)", type=["jpg", "jpeg", "png", "webp"],
-                        accept_multiple_files=True)
-files = []
-if imgs:
-    files = sorted(imgs, key=lambda f: nat(f.name))
-    key = tuple(f.name for f in files)
+def sk(f):
+    return ([int(x) for x in re.findall(r"\d+", f.name)][-1:] or [0], nat(f.name))
+
+
+nb = st.number_input("Image batches (use 2+ if you made images from different accounts)", 1, 6, 1)
+groups = []
+for bi in range(int(nb)):
+    g = st.file_uploader(f"Images - batch {bi+1}" if nb > 1 else "Images (upload all together)",
+                         type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
+                         key=f"imgs{bi}")
+    groups.append(sorted(g or [], key=sk))
+files = [f for g in groups for f in g]
+if files:
+    key = tuple((f.name, f.size) for f in files)
     if st.session_state.get("okey") != key:
         st.session_state.okey, st.session_state.order = key, list(range(len(files)))
     files = [files[i] for i in st.session_state.order]

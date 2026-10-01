@@ -1,4 +1,4 @@
-import asyncio, bisect, math, os, random, re, subprocess, tempfile, wave
+import asyncio, bisect, difflib, math, os, random, re, subprocess, tempfile, wave
 import cv2
 import numpy as np
 import streamlit as st
@@ -61,6 +61,13 @@ def parse_script(text):
     return [" ".join(p.split()) for p in parts if p.strip()]
 
 
+def scene_numbers(text):
+    if re.search(r"(?im)^\s*scene\s*\d+", text):
+        p = re.split(r"(?im)^\s*scene\s*(\d+)\s*[:.\-]?", text)
+        return [int(n) for n, body in zip(p[1::2], p[2::2]) if body.strip()]
+    return None
+
+
 def srt_t(t):
     ms = int(round(t * 1000))
     return f"{ms//3600000:02}:{ms//60000%60:02}:{ms//1000%60:02},{ms%1000:03}"
@@ -97,7 +104,7 @@ async def synth(text, voice, rate, path):
             if ch["type"] == "audio":
                 f.write(ch["data"])
             elif ch["type"] == "WordBoundary":
-                wb.append(ch["offset"] / 1e7)
+                wb.append((ch["offset"] / 1e7, ch.get("text", "")))
     return wb
 
 
@@ -117,15 +124,14 @@ def tts_scenes(scenes, voice, rate, tmp, prog):
             except Exception:
                 if attempt == 2: raise
         d = dur(mp3)
-        counts = [max(1, len(s.split())) for s in b]
-        tot, acc = sum(counts), 0
-        for j, c in enumerate(counts):
-            if j == 0:
-                starts.append(offset)
-            else:
-                t = wb[min(int(acc / tot * len(wb)), len(wb) - 1)] if wb else d * acc / tot
-                starts.append(offset + t)
-            acc += c
+        al = align_starts(b, wb) if wb else None
+        if al is None:
+            counts = [max(1, len(s.split())) for s in b]
+            tot, acc, al = sum(counts), 0, []
+            for c in counts:
+                al.append(d * acc / tot); acc += c
+        starts.append(offset)
+        starts.extend(offset + t for t in al[1:])
         offset += d; parts.append(mp3)
         prog.progress((bi + 1) / len(batches), "Making voice...")
     lst = os.path.join(tmp, "tts.txt")
@@ -136,6 +142,48 @@ def tts_scenes(scenes, voice, rate, tmp, prog):
     return out, list(zip(starts, ends))
 
 
+def norm_word(w):
+    return re.sub(r"[^a-z0-9']", "", w.lower().replace("\u2019", "'"))
+
+
+def align_starts(scenes, words):
+    """words = [(start_time, text)]. Returns the start time of every scene by matching
+    the script to the spoken words (so small differences do not shift later scenes)."""
+    toks, first = [], []
+    for sc in scenes:
+        first.append(len(toks))
+        toks += [t for t in (norm_word(x) for x in sc.split()) if t]
+    keep = [i for i, (_, t) in enumerate(words) if norm_word(t)]
+    wt = [norm_word(words[i][1]) for i in keep]
+    if not toks or not wt:
+        return None
+    mp = {}
+    for a, b, n in difflib.SequenceMatcher(None, toks, wt, autojunk=False).get_matching_blocks():
+        for k in range(n):
+            mp[a + k] = b + k
+    xs, out = sorted(mp), []
+    for f in first:
+        if f in mp:
+            j = mp[f]
+        else:
+            ip = bisect.bisect_left(xs, f)
+            lo = xs[ip - 1] if ip > 0 else None
+            hi = xs[ip] if ip < len(xs) else None
+            if lo is None and hi is None:
+                j = int(f / len(toks) * len(wt))
+            elif lo is None:
+                j = mp[hi] - (hi - f)
+            elif hi is None:
+                j = mp[lo] + (f - lo)
+            else:
+                j = round(mp[lo] + (mp[hi] - mp[lo]) * (f - lo) / (hi - lo))
+        j = min(max(j, 0), len(wt) - 1)
+        out.append(words[keep[j]][0])
+    for i in range(1, len(out)):
+        out[i] = max(out[i], out[i - 1])
+    return out
+
+
 def whisper_times(audio, scenes, total):
     from faster_whisper import WhisperModel
     r = subprocess.run(["ffmpeg", "-v", "error", "-i", audio, "-ac", "1", "-ar", "16000",
@@ -144,15 +192,12 @@ def whisper_times(audio, scenes, total):
         raise RuntimeError("Could not read audio for Whisper.")
     segs, _ = WhisperModel("base.en", compute_type="int8").transcribe(
         np.frombuffer(r.stdout, np.float32), language="en", word_timestamps=True)
-    words = [w for s in segs for w in s.words]
-    if not words:
+    words = [(w.start, w.word) for sg in segs for w in sg.words]
+    st_ = align_starts(scenes, words) if words else None
+    if st_ is None:
         return equal_times(len(scenes), total)
-    counts = [max(1, len(s.split())) for s in scenes]
-    tot, acc, b = sum(counts), 0, [0.0]
-    for c in counts[:-1]:
-        acc += c
-        b.append(words[min(int(acc / tot * len(words)), len(words) - 1)].start)
-    b.append(total)
+    st_[0] = 0.0
+    b = st_ + [total]
     return list(zip(b[:-1], b[1:]))
 
 
@@ -392,6 +437,7 @@ if files:
             st.rerun()
 
 st.subheader("Video settings")
+shift = st.slider("Image timing shift (sec): minus = images change earlier, plus = later", -1.0, 1.0, 0.0, 0.05)
 rname = st.selectbox("Platform / ratio", list(RATIOS))
 q = st.radio("Quality", ["1080p (HD)", "720p (faster)"], horizontal=True)
 fit = st.selectbox("If image does not match the ratio", FITS)
@@ -434,8 +480,22 @@ if st.button("Make video"):
         if mode != M_A:
             if not scenes:
                 st.error("Script is empty."); st.stop()
-            if len(scenes) != len(files):
-                st.error(f"{len(scenes)} scenes in script but {len(files)} images. They must match.")
+            snums = scene_numbers(script)
+            inums = [nums(f)[0] for f in files]
+            can_match = bool(snums) and len(snums) == len(scenes) and all(inums) and len(set(inums)) == len(inums)
+            if can_match and set(snums) == set(inums):
+                by_num = {nums(f)[0]: f for f in files}
+                files = [by_num[n] for n in snums]
+                st.info("Images matched to the script by scene number (Scene N = image N).")
+            elif len(scenes) != len(files):
+                msg = f"{len(scenes)} scenes in script but {len(files)} images. They must match."
+                if can_match:
+                    miss, extra = sorted(set(snums) - set(inums)), sorted(set(inums) - set(snums))
+                    if miss:
+                        msg += f" Scenes with no image: {miss[:20]}."
+                    if extra:
+                        msg += f" Images with no scene: {extra[:20]}."
+                st.error(msg)
                 st.stop()
         prog = st.progress(0.0, "Starting...")
         with tempfile.TemporaryDirectory() as tmp:
@@ -465,6 +525,11 @@ if st.button("Make video"):
             elif mode == M_A:
                 times = equal_times(len(files), total)
             times = [(a, b) for a, b in times]
+            if shift and len(times) > 1:
+                bs = [times[0][0]] + [min(max(a + shift, 0.0), total) for a, _ in times[1:]] + [total]
+                for i in range(1, len(bs)):
+                    bs[i] = max(bs[i], bs[i - 1])
+                times = list(zip(bs[:-1], bs[1:]))
             times[-1] = (times[-1][0], total)
 
             W, H = dims(RATIOS[rname], 1080 if q.startswith("1080") else 720)

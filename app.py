@@ -1,4 +1,6 @@
-import asyncio, os, re, subprocess, tempfile
+import asyncio, bisect, math, os, random, re, subprocess, tempfile, wave
+import cv2
+import numpy as np
 import streamlit as st
 from PIL import Image, ImageFilter, ImageOps
 
@@ -22,6 +24,10 @@ VOICES = {
     "Sonia - female (UK)": "en-GB-SoniaNeural",
 }
 M_A, M_B, M_C = "Audio + Images", "Audio + Script + Images", "Script + Images (app makes the voice)"
+ZOOMS = ["Off", "Zoom in", "Zoom out", "Alternate in/out"]
+TRANS = ["Cut (none)", "Fade", "Slide left", "Slide right", "Wipe", "Flash", "Random mix"]
+EVERY = {"Every scene": 1, "Every 2nd scene": 2, "Every 3rd scene": 3, "Every 5th scene": 5}
+SR = 22050
 FITS = ["Blur background", "Fit (full image, black bars)", "Crop (fill screen)"]
 
 
@@ -61,6 +67,8 @@ def srt_t(t):
 
 
 def prep_image(src, dst, W, H, fit):
+    if hasattr(src, "seek"):
+        src.seek(0)
     im = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
     if fit.startswith("Crop"):
         out = ImageOps.fit(im, (W, H), Image.LANCZOS)
@@ -72,7 +80,9 @@ def prep_image(src, dst, W, H, fit):
             bg = Image.new("RGB", (W, H))
         bg.paste(fg, ((W - fg.width) // 2, (H - fg.height) // 2))
         out = bg
-    out.save(dst, quality=92)
+    if dst is None:
+        return np.ascontiguousarray(np.asarray(out)[:, :, ::-1])
+    out.save(dst, quality=95)
 
 
 async def synth(text, voice, rate, path):
@@ -128,8 +138,12 @@ def tts_scenes(scenes, voice, rate, tmp, prog):
 
 def whisper_times(audio, scenes, total):
     from faster_whisper import WhisperModel
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", audio, "-ac", "1", "-ar", "16000",
+                        "-f", "f32le", "-"], capture_output=True)
+    if r.returncode:
+        raise RuntimeError("Could not read audio for Whisper.")
     segs, _ = WhisperModel("base.en", compute_type="int8").transcribe(
-        audio, language="en", word_timestamps=True)
+        np.frombuffer(r.stdout, np.float32), language="en", word_timestamps=True)
     words = [w for s in segs for w in s.words]
     if not words:
         return equal_times(len(scenes), total)
@@ -144,6 +158,170 @@ def whisper_times(audio, scenes, total):
 
 def equal_times(n, total):
     return [(i * total / n, (i + 1) * total / n) for i in range(n)]
+
+
+
+# ---------------- effects: zoom, transitions, sound effects, music ----------------
+def ease(p):
+    p = min(max(p, 0.0), 1.0)
+    return p * p * (3 - 2 * p)
+
+
+def zval(i, t, a, b, mode, amt):
+    if mode == "Off":
+        return 1.0
+    p = ease((t - a) / max(b - a, 1e-3))
+    if mode == "Zoom in":
+        return 1 + amt * p
+    if mode == "Zoom out":
+        return 1 + amt * (1 - p)
+    return 1 + amt * (p if i % 2 == 0 else 1 - p)
+
+
+def blend(A, B, p, kind):
+    p = ease(p)
+    H, W = A.shape[:2]
+    x = int(W * p)
+    if kind == "Fade":
+        return cv2.addWeighted(A, 1 - p, B, p, 0)
+    if kind == "Flash":
+        white = np.full_like(A, 255)
+        if p < 0.5:
+            return cv2.addWeighted(A, 1 - 2 * p, white, 2 * p, 0)
+        return cv2.addWeighted(white, 2 - 2 * p, B, 2 * p - 1, 0)
+    out = np.empty_like(A)
+    if kind == "Slide left":
+        out[:, :W - x] = A[:, x:]; out[:, W - x:] = B[:, :x]
+    elif kind == "Slide right":
+        out[:, x:] = A[:, :W - x]; out[:, :x] = B[:, W - x:]
+    else:  # Wipe
+        out[:] = A; out[:, :x] = B[:, :x]
+    return out
+
+
+class SceneCache:
+    def __init__(self, files, W, H, fit, s):
+        self.files, self.W, self.H, self.fit = files, W, H, fit
+        self.SW, self.SH = int(W * s) // 2 * 2, int(H * s) // 2 * 2
+        self.cache = {}
+
+    def get(self, i):
+        if i not in self.cache:
+            if len(self.cache) >= 4:
+                self.cache.pop(next(iter(self.cache)))
+            self.cache[i] = prep_image(self.files[i], None, self.SW, self.SH, self.fit)
+        return self.cache[i]
+
+    def view(self, i, z):
+        img = self.get(i)
+        cw, ch = min(int(self.SW / z) // 2 * 2, self.SW), min(int(self.SH / z) // 2 * 2, self.SH)
+        x0, y0 = (self.SW - cw) // 2, (self.SH - ch) // 2
+        crop = np.ascontiguousarray(img[y0:y0 + ch, x0:x0 + cw])
+        if cw == self.W and ch == self.H:
+            return crop
+        return cv2.resize(crop, (self.W, self.H), interpolation=cv2.INTER_LINEAR)
+
+
+def render_fx(files, times, kinds, W, H, fit, zmode, zamt, tkind, tdur, fps, total,
+              audio, vf, out, log, prog):
+    sc = SceneCache(files, W, H, fit, 1 + zamt if zmode != "Off" else 1.0)
+    n, starts = len(times), [a for a, _ in times]
+
+    def zv(i, t):
+        return zval(i, t, times[i][0], times[i][1], zmode, zamt)
+
+    def dk(k):
+        return min(tdur, 0.5 * (times[k][1] - times[k][0]), 0.5 * (times[k + 1][1] - times[k + 1][0]))
+
+    wr = subprocess.Popen(
+        ["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}",
+         "-r", str(fps), "-i", "-", "-i", audio, "-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
+         "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+         "-map", "0:v", "-map", "1:a", "-shortest", out], stdin=subprocess.PIPE, stderr=log)
+    nf, last_i, last_bytes = int(round(total * fps)), -1, None
+    for fi in range(nf):
+        t = fi / fps
+        i = min(max(bisect.bisect_right(starts, t) - 1, 0), n - 1)
+        frame = None
+        if tkind != "Cut (none)":
+            if i + 1 < n:
+                d = dk(i); s0 = times[i][1] - d / 2
+                if d >= 0.04 and t >= s0:
+                    frame = blend(sc.view(i, zv(i, t)), sc.view(i + 1, zv(i + 1, t)), (t - s0) / d, kinds[i])
+            if frame is None and i > 0:
+                d = dk(i - 1); s0 = times[i - 1][1] - d / 2
+                if d >= 0.04 and t < s0 + d:
+                    frame = blend(sc.view(i - 1, zv(i - 1, t)), sc.view(i, zv(i, t)), (t - s0) / d, kinds[i - 1])
+        if frame is not None:
+            data, last_i = frame.tobytes(), -1
+        elif zmode == "Off" and i == last_i:
+            data = last_bytes
+        else:
+            data = sc.view(i, zv(i, t)).tobytes()
+            if zmode == "Off":
+                last_i, last_bytes = i, data
+        wr.stdin.write(data)
+        if fi % 24 == 0:
+            prog.progress(min(fi / nf, 1.0), f"Rendering video {fi}/{nf} frames (keep this page open)")
+    wr.stdin.close(); wr.wait()
+    if wr.returncode:
+        raise RuntimeError("Video writer failed. " + open(log.name).read()[-400:])
+
+
+def make_sfx():
+    rng = np.random.default_rng(1)
+    n = int(0.6 * SR); t = np.linspace(0, 1, n)
+    noise = rng.standard_normal(n).astype(np.float32)
+    coef = 0.02 + 0.5 * np.sin(np.pi * t) ** 2
+    y, acc = np.zeros(n, np.float32), 0.0
+    for i in range(n):
+        acc += coef[i] * (noise[i] - acc); y[i] = acc
+    y = y * np.sin(np.pi * t) ** 1.5
+    whoosh = y / max(np.abs(y).max(), 1e-6)
+    n = int(0.15 * SR); tt = np.arange(n) / SR
+    pop = (np.sin(2 * np.pi * (600 + 500 * np.exp(-tt * 40)) * tt) * np.exp(-tt * 35)).astype(np.float32)
+    return {"whoosh": (whoosh, 0.3), "pop": (pop, 0.0)}
+
+
+def write_sfx(path, dur_s, events, vol):
+    lib = make_sfx()
+    total = int(dur_s * SR)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR)
+        for c0 in range(0, total, SR * 60):
+            c1 = min(total, c0 + SR * 60)
+            buf = np.zeros(c1 - c0, np.float32)
+            for t, k in events:
+                snd, lead = lib[k]
+                s0 = int((t - lead) * SR); s1 = s0 + len(snd)
+                if s1 <= c0 or s0 >= c1:
+                    continue
+                a, b = max(s0, c0), min(s1, c1)
+                buf[a - c0:b - c0] += snd[a - s0:b - s0]
+            w.writeframes((np.clip(buf * 0.9 * vol, -1, 1) * 32767).astype("<i2").tobytes())
+
+
+def mix_audio(voice, sfx, music, total, mvol, duck, tmp):
+    out = os.path.join(tmp, "mix.wav")
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", voice]
+    fmt = "aformat=sample_rates=44100:channel_layouts=stereo"
+    fl, mix, idx = [], ["[vm]"], 1
+    fl.append(f"[0:a]{fmt},asplit=2[vm][vs]" if (music and duck) else f"[0:a]{fmt}[vm]")
+    if sfx:
+        cmd += ["-i", sfx]; fl.append(f"[{idx}:a]{fmt}[sx]"); mix.append("[sx]"); idx += 1
+    if music:
+        cmd += ["-stream_loop", "-1", "-i", music]
+        fl.append(f"[{idx}:a]{fmt},volume={mvol},atrim=0:{total:.2f},"
+                  f"afade=t=out:st={max(total - 3, 0):.2f}:d=3[mu]")
+        if duck:
+            fl.append("[mu][vs]sidechaincompress=threshold=0.03:ratio=10:attack=15:release=400[md]")
+            mix.append("[md]")
+        else:
+            mix.append("[mu]")
+    fl.append(f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:normalize=0,alimiter=limit=0.95[out]")
+    run(cmd + ["-filter_complex", ";".join(fl), "-map", "[out]", "-t", f"{total:.2f}",
+               "-ar", "44100", out])
+    return out
 
 
 # ---------------- UI ----------------
@@ -166,17 +344,35 @@ if mode == M_C:
             asyncio.run(synth("Hello! This is how my voice sounds in your video.", voice, "+0%", p))
             st.audio(open(p, "rb").read())
 
-def sk(f):
-    return ([int(x) for x in re.findall(r"\d+", f.name)][-1:] or [0], nat(f.name))
+ORDERS = ["Auto (recommended)", "Number at start of file name", "Number at end of file name",
+          "File name (A-Z)"]
 
 
+def nums(f):
+    return [int(x) for x in re.findall(r"\d+", f.name)] or [0]
+
+
+def sort_files(g, how):
+    if not g:
+        return []
+    first, last = [nums(f)[0] for f in g], [nums(f)[-1] for f in g]
+    if how.startswith("Auto"):
+        how = ORDERS[1] if len(set(first)) == len(g) else (ORDERS[2] if len(set(last)) == len(g) else ORDERS[3])
+    if how == ORDERS[1]:
+        return sorted(g, key=lambda f: (nums(f)[0], nat(f.name)))
+    if how == ORDERS[2]:
+        return sorted(g, key=lambda f: (nums(f)[-1], nat(f.name)))
+    return sorted(g, key=lambda f: nat(f.name))
+
+
+order_by = st.selectbox("Order images by", ORDERS)
 nb = st.number_input("Image batches (use 2+ if you made images from different accounts)", 1, 6, 1)
 groups = []
 for bi in range(int(nb)):
     g = st.file_uploader(f"Images - batch {bi+1}" if nb > 1 else "Images (upload all together)",
                          type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
                          key=f"imgs{bi}")
-    groups.append(sorted(g or [], key=sk))
+    groups.append(sort_files(g or [], order_by))
 files = [f for g in groups for f in g]
 if files:
     key = tuple((f.name, f.size) for f in files)
@@ -210,6 +406,23 @@ caps = False
 if mode != M_A:
     caps = st.checkbox("Burn captions into video", True)
     cpos = st.radio("Caption position", ["Bottom", "Middle"], horizontal=True)
+
+
+st.subheader("Effects")
+zmode = st.selectbox("Zoom on images", ZOOMS)
+zamt = st.slider("Zoom strength (%)", 3, 20, 8) / 100 if zmode != "Off" else 0.0
+tkind = st.selectbox("Transition between scenes", TRANS)
+tdur = st.slider("Transition length (sec)", 0.2, 1.0, 0.4, 0.1) if tkind != "Cut (none)" else 0.0
+sfx_kind = st.selectbox("Sound effect on scene changes", ["Off", "Whoosh", "Pop", "Mixed (auto)"])
+sfx_vol, sfx_every = 0, 1
+if sfx_kind != "Off":
+    sfx_vol = st.slider("Sound effect volume (%)", 10, 100, 40)
+    sfx_every = EVERY[st.selectbox("Play sound effect on", list(EVERY), index=1)]
+music_f = st.file_uploader("Background music (optional)", type=["mp3", "wav", "m4a"])
+mvol, duck = 18, True
+if music_f:
+    mvol = st.slider("Music volume (%)", 5, 60, 18)
+    duck = st.checkbox("Lower music while the voice speaks", True)
 
 if st.button("Make video"):
     try:
@@ -255,15 +468,39 @@ if st.button("Make video"):
             times[-1] = (times[-1][0], total)
 
             W, H = dims(RATIOS[rname], 1080 if q.startswith("1080") else 720)
-            lst = os.path.join(tmp, "list.txt")
-            with open(lst, "w") as lf:
-                for i, (f, (a, b)) in enumerate(zip(files, times)):
-                    p = os.path.join(tmp, f"img_{i}.jpg")
-                    prep_image(f, p, W, H, fit)
-                    lf.write(f"file '{p}'\nduration {max(b - a, 0.05):.3f}\n")
-                    if i % 10 == 0:
-                        prog.progress((i + 1) / len(files), f"Preparing images {i+1}/{len(files)}")
-                lf.write(f"file '{p}'\n")
+            n = len(times)
+            fx = zmode != "Off" or tkind != "Cut (none)"
+            rng = random.Random(7)
+            pool = ["Fade", "Slide left", "Slide right", "Wipe"]
+            kinds = [rng.choice(pool) if tkind.startswith("Random") else tkind for _ in range(max(n - 1, 0))]
+
+            final_audio, events = audio, []
+            if sfx_kind != "Off" and n > 1:
+                last = -99.0
+                for k in range(n - 1):
+                    if k % sfx_every:
+                        continue
+                    t = times[k][1]
+                    if t - last < 0.6:
+                        continue
+                    if sfx_kind == "Whoosh":
+                        kind = "whoosh"
+                    elif sfx_kind == "Pop":
+                        kind = "pop"
+                    else:
+                        kind = "whoosh" if kinds[k] in ("Slide left", "Slide right", "Wipe", "Flash") else "pop"
+                    events.append((t, kind)); last = t
+            sfx_path = mus_path = None
+            if events:
+                sfx_path = os.path.join(tmp, "sfx.wav")
+                write_sfx(sfx_path, total, events, sfx_vol / 100)
+            if music_f:
+                mus_path = os.path.join(tmp, "music" + os.path.splitext(music_f.name)[1])
+                open(mus_path, "wb").write(music_f.getvalue())
+            if sfx_path or mus_path:
+                prog.progress(0.0, "Mixing audio...")
+                final_audio = mix_audio(audio, sfx_path, mus_path, total, mvol / 100, duck, tmp)
+
             vf = "format=yuv420p"
             if caps:
                 srt = os.path.join(tmp, "cap.srt")
@@ -275,10 +512,24 @@ if st.button("Make video"):
                       f"'FontName=DejaVu Sans,FontSize={fs},Bold=1,Outline=3,Shadow=0,"
                       f"Alignment={al},MarginV={int(H*0.08)}',format=yuv420p")
             out = os.path.join(tmp, "out.mp4")
-            prog.progress(1.0, "Rendering video (please wait, keep this page open)...")
-            run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", audio,
-                 "-vf", vf, "-r", "24", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                 "-c:a", "aac", "-b:a", "192k", "-shortest", out])
+            if fx:
+                with open(os.path.join(tmp, "ff.log"), "w") as log:
+                    render_fx(files, times, kinds, W, H, fit, zmode, zamt, tkind, tdur, 24, total,
+                              final_audio, vf, out, log, prog)
+            else:
+                lst = os.path.join(tmp, "list.txt")
+                with open(lst, "w") as lf:
+                    for i, (f, (a, b)) in enumerate(zip(files, times)):
+                        p = os.path.join(tmp, f"img_{i}.jpg")
+                        prep_image(f, p, W, H, fit)
+                        lf.write(f"file '{p}'\nduration {max(b - a, 0.05):.3f}\n")
+                        if i % 10 == 0:
+                            prog.progress((i + 1) / len(files), f"Preparing images {i+1}/{len(files)}")
+                    lf.write(f"file '{p}'\n")
+                prog.progress(1.0, "Rendering video (please wait, keep this page open)...")
+                run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", final_audio,
+                     "-vf", vf, "-r", "24", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                     "-c:a", "aac", "-b:a", "192k", "-shortest", out])
             st.session_state.video = open(out, "rb").read()
         prog.empty()
         st.success("Done!")

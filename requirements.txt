@@ -2,3 +2,5 @@ streamlit
 faster-whisper
 edge-tts
 pillow
+opencv-python-headless
+numpy
